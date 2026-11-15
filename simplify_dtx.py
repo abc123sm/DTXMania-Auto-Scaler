@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import shutil
 
 # 优先级: 数值越小优先级越高。在面临同拍和同小节削减时，优先保留高优先级乐器。
 # 主镲 > 军鼓 > 踩镲 > 副镲 > 嗵鼓 > 其他
@@ -321,7 +322,8 @@ def process_single_dtx(file_path):
             else:
                 out_lines.append(pl['raw'])
                 
-        out_path = file_path.replace('.dtx', diff_cfg['suffix'])
+        # 使用大小写不敏感的末尾扩展名替换，避免大写 .DTX 覆盖原文件或误替换目录名中的 .dtx
+        out_path = re.sub(r'\.dtx$', diff_cfg['suffix'], file_path, flags=re.IGNORECASE)
         with open(out_path, 'w', encoding=enc) as f:
             f.writelines(out_lines)
             
@@ -329,42 +331,69 @@ def process_single_dtx(file_path):
         
     return original_title, generated_files, enc
 
+def inspect_set_def(set_def_path):
+    """解析 set.def 内容，返回 (是否为 AI 生成, 有效难度文件条目列表)。"""
+    enc = detect_encoding(set_def_path)
+    with open(set_def_path, 'r', encoding=enc, errors='ignore') as f:
+        content = f.read()
+
+    is_ai = bool(re.search(r'^[ \t]*#TITLE\b.*\(AI mode\)', content, flags=re.IGNORECASE | re.MULTILINE))
+    raw_entries = re.findall(
+        r'^[ \t]*#L\d+FILE(?:[ \t]*:[ \t]*|[ \t]+)([^\r\n;]+)',
+        content,
+        flags=re.IGNORECASE | re.MULTILINE
+    )
+    lfile_entries = [entry.strip() for entry in raw_entries if entry.strip()]
+    return is_ai, lfile_entries
+
 def process_directory(dir_path):
     try:
         print(f"Scanning directory: {dir_path}")
     except:
         pass
     
-    set_def_path = os.path.join(dir_path, "set.def")
-    if os.path.exists(set_def_path):
+    entries = os.listdir(dir_path)
+    ai_suffixes = tuple(cfg['suffix'].lower() for cfg in DIFFICULTIES.values())
+    dtx_files = [f for f in entries if f.lower().endswith('.dtx')]
+    orig_dtx_files = [f for f in dtx_files if not f.lower().endswith(ai_suffixes)]
+
+    # 大小写不敏感匹配现有 set.def，便于保护 SET.def 等变体
+    existing_set_def = next((f for f in entries if f.lower() == 'set.def'), None)
+    set_def_path = os.path.join(dir_path, existing_set_def) if existing_set_def else os.path.join(dir_path, "set.def")
+
+    if existing_set_def:
         try:
-            # 尝试读取第一行判断是否为 AI mode
-            enc = detect_encoding(set_def_path)
-            is_ai = False
-            with open(set_def_path, 'r', encoding=enc, errors='ignore') as f:
-                first_line = f.readline()
-                if "(AI mode)" in first_line:
-                    is_ai = True
-            
-            if not is_ai:
-                try: print("Skipping directory (Protected Original)")
-                except: pass
-                return
-            else:
-                try: print("Updating AI generated set.def")
-                except: pass
+            is_ai, lfile_entries = inspect_set_def(set_def_path)
         except Exception as e:
             try: print("Skipping directory (Error reading set.def)")
             except: pass
             return
+
+        if is_ai:
+            try: print("Updating AI generated set.def")
+            except: pass
+        elif len(lfile_entries) <= 1 and len(orig_dtx_files) == 1:
+            # 仅当原始谱面唯一且原 set.def 最多挂载 1 个难度时，视为单谱面外壳，先备份后生成 AI 难度
+            bak_path = os.path.join(dir_path, "set.def.bak")
+            if not os.path.exists(bak_path):
+                shutil.copy2(set_def_path, bak_path)
+            try: print("Backing up single-chart set.def and generating AI difficulties")
+            except: pass
+        else:
+            try: print("Skipping directory (Protected Original)")
+            except: pass
+            return
     
-    dtx_files = [f for f in os.listdir(dir_path) if f.lower().endswith('.dtx')]
     main_dtx = None
-    for f in dtx_files:
-        fl = f.lower()
-        if not any(x in fl for x in ['_aimode_bsc', '_aimode_adv', '_aimode_ext', '_aimode_mstr', '_bsc', '_adv', '_ext', '_mstr', '_easy']):
-            main_dtx = f
-            break
+    if len(orig_dtx_files) == 1:
+        # 目录内仅存在单个原始谱面时直接选用，避免文件名自带 _ext / _mstr 等字样被误过滤
+        main_dtx = orig_dtx_files[0]
+    else:
+        for f in orig_dtx_files:
+            fl = f.lower()
+            if not any(x in fl for x in ['_bsc', '_adv', '_ext', '_mstr', '_easy']):
+                main_dtx = f
+                break
             
     if not main_dtx:
         return
@@ -372,7 +401,6 @@ def process_directory(dir_path):
     main_dtx_path = os.path.join(dir_path, main_dtx)
     title, gen_files, enc = process_single_dtx(main_dtx_path)
     
-    set_def_path = os.path.join(dir_path, "set.def")
     with open(set_def_path, 'w', encoding=enc) as f:
         f.write(f"#TITLE {title} (AI mode)\n\n")
         f.write(f"#L1LABEL BASIC\n")
